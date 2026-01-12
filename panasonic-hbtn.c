@@ -1,22 +1,13 @@
 /*
  *  Panasonic Tablet Button driver
  *  (C) 2012 Heiher <admin@heiher.info>
+ *  Modified for FZ-G1 MK4 support
  *
  *  derived from panasonic-laptop.c, Copyright (C) 2002-2004 John Belmonte
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2 as
  *  publicshed by the Free Software Foundation.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307  USA
- *
  */
 
 #include <linux/kernel.h>
@@ -28,14 +19,12 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
-#include <acpi/acpi_bus.h>
-#include <acpi/acpi_drivers.h>
 #include <linux/input.h>
 #include <linux/input/sparse-keymap.h>
 
 
 MODULE_AUTHOR("Heiher");
-MODULE_DESCRIPTION("ACPI Tablet Button driver for Panasonic CF-18/19 laptops");
+MODULE_DESCRIPTION("ACPI Tablet Button driver for Panasonic CF-18/19/FZ-G1 laptops");
 MODULE_LICENSE("GPL");
 
 /* Define ACPI PATHs */
@@ -49,12 +38,12 @@ MODULE_LICENSE("GPL");
 #define ACPI_PCC_INPUT_PHYS    "panasonic/hbtn0"
 
 static int acpi_pcc_hbtn_add(struct acpi_device *device);
-static int acpi_pcc_hbtn_remove(struct acpi_device *device);
 static void acpi_pcc_hbtn_notify(struct acpi_device *device, u32 event);
 
 static const struct acpi_device_id pcc_device_ids[] = {
     { "MAT001F", 0},
     { "MAT0020", 0},
+    { "MAT0037", 0},  /* FZ-G1 MK4 */
     { "", 0},
 };
 MODULE_DEVICE_TABLE(acpi, pcc_device_ids);
@@ -62,21 +51,24 @@ MODULE_DEVICE_TABLE(acpi, pcc_device_ids);
 static struct acpi_driver acpi_pcc_driver = {
     .name =     ACPI_PCC_DRIVER_NAME,
     .class =    ACPI_PCC_CLASS,
-    .ids =        pcc_device_ids,
-    .ops =        {
+    .ids =      pcc_device_ids,
+    .ops =      {
                 .add =       acpi_pcc_hbtn_add,
-                .remove =    acpi_pcc_hbtn_remove,
                 .notify =    acpi_pcc_hbtn_notify,
             },
 };
 
 static const struct key_entry panasonic_keymap[] = {
     { KE_KEY, 0x0, { KEY_RESERVED } },
-    { KE_KEY, 0x4, { KEY_SCREENLOCK } }, /* Screen lock */
-//    { KE_KEY, 0x6, { KEY_DIRECTION } }, /* Screen rotate */
-    { KE_KEY, 0x6, { KEY_MSDOS } }, /* XF86DOS */
-    { KE_KEY, 0x8, { KEY_ESC } }, /* Escape */
-    { KE_KEY, 0xA, { KEY_MENU } }, /* XF86MenuKB */
+    /* CF-18/19 buttons */
+    { KE_KEY, 0x4, { KEY_SCREENLOCK } },
+    { KE_KEY, 0x6, { KEY_MSDOS } },
+    { KE_KEY, 0x8, { KEY_ESC } },
+    { KE_KEY, 0xA, { KEY_MENU } },
+    /* FZ-G1 MK4 buttons (codes 0x36, 0x38, 0x42) */
+    { KE_KEY, 0x36, { KEY_PROG1 } },     /* A1 button */
+    { KE_KEY, 0x38, { KEY_PROG2 } },     /* A2 button */
+    { KE_KEY, 0x42, { KEY_LEFTMETA } },  /* Windows button */
     { KE_END, 0 }
 };
 
@@ -94,27 +86,34 @@ static void acpi_pcc_generate_keyinput(struct pcc_acpi *pcc)
     int rc;
     unsigned long long result;
     struct key_entry *ke = NULL;
+    unsigned int scancode;
+    int pressed;
 
     rc = acpi_evaluate_integer(pcc->handle, METHOD_HBTN_QUERY,
                    NULL, &result);
     if (!ACPI_SUCCESS(rc)) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                 "error getting hbtn status\n"));
+        pr_err("panasonic-hbtn: error getting hbtn status\n");
         return;
     }
 
     acpi_bus_generate_netlink_event(pcc->device->pnp.device_class,
-				dev_name(&pcc->device->dev), HBTN_NOTIFY, result);
+                    dev_name(&pcc->device->dev), HBTN_NOTIFY, result);
 
-    ke = sparse_keymap_entry_from_scancode(hotk_input_dev, result & 0xe);
+    /* Bit 0 is press/release: 0=press, 1=release */
+    pressed = !(result & 0x1);
+    scancode = result & ~1UL;
+
+    pr_debug("panasonic-hbtn: raw=0x%llx scancode=0x%x pressed=%d\n",
+             result, scancode, pressed);
+
+    ke = sparse_keymap_entry_from_scancode(hotk_input_dev, scancode);
     if (!ke) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Unknown hbtn event: %d\n", result));
+        pr_warn("panasonic-hbtn: Unknown button event: 0x%llx (scancode 0x%x)\n",
+                result, scancode);
         return;
     }
 
-    sparse_keymap_report_entry(hotk_input_dev, ke,
-                (result & 0x1) ? 0 : 1, false);
+    sparse_keymap_report_entry(hotk_input_dev, ke, pressed, false);
 }
 
 static void acpi_pcc_hbtn_notify(struct acpi_device *device, u32 event)
@@ -126,7 +125,6 @@ static void acpi_pcc_hbtn_notify(struct acpi_device *device, u32 event)
         acpi_pcc_generate_keyinput(pcc);
         break;
     default:
-        /* nothing to do */
         break;
     }
 }
@@ -138,8 +136,7 @@ static int acpi_pcc_init_input(struct pcc_acpi *pcc)
 
     input_dev = input_allocate_device();
     if (!input_dev) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Couldn't allocate input device for hbtn"));
+        pr_err("panasonic-hbtn: Couldn't allocate input device\n");
         return -ENOMEM;
     }
 
@@ -152,23 +149,19 @@ static int acpi_pcc_init_input(struct pcc_acpi *pcc)
 
     error = sparse_keymap_setup(input_dev, panasonic_keymap, NULL);
     if (error) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Unable to setup input device keymap\n"));
+        pr_err("panasonic-hbtn: Unable to setup keymap\n");
         goto err_free_dev;
     }
 
     error = input_register_device(input_dev);
     if (error) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Unable to register input device\n"));
-        goto err_free_keymap;
+        pr_err("panasonic-hbtn: Unable to register input device\n");
+        goto err_free_dev;
     }
 
     pcc->input_dev = input_dev;
     return 0;
 
- err_free_keymap:
-    input_unregister_device(input_dev);
  err_free_dev:
     input_free_device(input_dev);
     return error;
@@ -176,15 +169,8 @@ static int acpi_pcc_init_input(struct pcc_acpi *pcc)
 
 static void acpi_pcc_destroy_input(struct pcc_acpi *pcc)
 {
-    // sparse_keymap_free(pcc->input_dev);
     input_unregister_device(pcc->input_dev);
-    /*
-     * No need to input_free_device() since core input API refcounts
-     * and free()s the device.
-     */
 }
-
-/* kernel module interface */
 
 static int acpi_pcc_hbtn_add(struct acpi_device *device)
 {
@@ -196,8 +182,7 @@ static int acpi_pcc_hbtn_add(struct acpi_device *device)
 
     pcc = kzalloc(sizeof(struct pcc_acpi), GFP_KERNEL);
     if (!pcc) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Couldn't allocate mem for pcc"));
+        pr_err("panasonic-hbtn: Couldn't allocate memory\n");
         return -ENOMEM;
     }
 
@@ -209,46 +194,40 @@ static int acpi_pcc_hbtn_add(struct acpi_device *device)
 
     result = acpi_pcc_init_input(pcc);
     if (result) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Error installing keyinput handler\n"));
-        goto out_hbtn;
+        pr_err("panasonic-hbtn: Error installing keyinput handler\n");
+        kfree(pcc);
+        return result;
     }
 
+    pr_info("panasonic-hbtn: Tablet button driver loaded for %s\n",
+            acpi_device_hid(device));
+
     return 0;
+}
 
-out_hbtn:
+static void acpi_pcc_hbtn_remove(struct acpi_device *device)
+{
+    struct pcc_acpi *pcc = acpi_driver_data(device);
+
+    if (!device || !pcc)
+        return;
+
+    acpi_pcc_destroy_input(pcc);
     kfree(pcc);
-
-    return result;
 }
 
 static int __init acpi_pcc_init(void)
 {
-    int result = 0;
+    int result;
 
     if (acpi_disabled)
         return -ENODEV;
 
     result = acpi_bus_register_driver(&acpi_pcc_driver);
     if (result < 0) {
-        ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-                  "Error registering hbtn driver\n"));
+        pr_err("panasonic-hbtn: Error registering driver\n");
         return -ENODEV;
     }
-
-    return 0;
-}
-
-static int acpi_pcc_hbtn_remove(struct acpi_device *device)
-{
-    struct pcc_acpi *pcc = acpi_driver_data(device);
-
-    if (!device || !pcc)
-        return -EINVAL;
-
-    acpi_pcc_destroy_input(pcc);
-
-    kfree(pcc);
 
     return 0;
 }
